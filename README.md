@@ -698,7 +698,16 @@ curl -X POST http://localhost:8000/experiments/<experiment_id>/complete \
 - `next_available_at`：下一周期最早可推进的时刻（上一周期 `completed_at + washout_seconds`）。
   周期 1 之前、实验已结束，或上一周期尚未完成时为 `null`。
 
-实验或受试者不存在返回 `404`。
+**一致性读（避免跨时点拼接）**：进度查询在首次读取之前显式开启同一个
+SQLite 一致性读事务（`BEGIN`），实验配置、换号墓碑、受试者名册、已揭盲
+记录、完成记录与 `next_period` 进度全部取自同一读快照。即使查询期间恰好
+有推进 / 完成登记 / 换号写事务并发提交，响应也只可能对应写入**之前**或
+**之后**的完整状态：不会出现 `next_period=2` 却缺少第 1 期揭盲、
+`next_available_at` 与完成记录错位等周期号 / 揭盲记录错配；换号一旦提交，
+退役旧编号在新快照下一律 `409 subject_replaced`，绝不再返回进度。
+
+实验或受试者不存在返回 `404`；受试者编号已因换号退役（墓碑）返回
+`409 subject_replaced`。
 
 ### 暂停实验 `POST /experiments/{experiment_id}/pause`
 

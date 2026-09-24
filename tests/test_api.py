@@ -9,6 +9,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -6086,3 +6087,213 @@ def test_legacy_database_supports_enrollment_locks_after_migration(
         again = acquire_locks(migrated, "legacy-enr", ["s1"], "enr-legacy-2")
         assert again.status_code == 201
         assert again.json()["reservation_id"] != body["reservation_id"]
+
+
+# ---------- 进度查询的一致性读（并发推进 / 完成 / 换号） ----------
+
+
+def _assert_progress_is_coherent(progress: dict) -> None:
+    """进度响应必须自洽：揭盲周期恰好覆盖 1..next_period-1，且最后一期与
+    completed 标记一致。跨时点拼接会破坏该不变量（如 next_period=2 却缺少
+    第 1 期揭盲，或退役编号仍返回进度）。
+    """
+    next_period = progress["next_period"]
+    num_periods = progress["num_periods"]
+    assert next_period >= 1
+    assert [r["period"] for r in progress["reveals"]] == list(
+        range(1, next_period)
+    )
+    assert progress["completed"] is (next_period > num_periods)
+
+
+class _ProgressTracingConnection(sqlite3.Connection):
+    """记录进度查询各 SELECT 是否处于事务中，并在命中语句时放行后台写线程。
+
+    只在武装窗口内、且仅读线程（主线程）记录事务状态；写线程自身的连接
+    不记录也不触发，避免与写事务内同名语句混淆。
+    """
+
+    marker = ""
+    launch: threading.Event | None = None
+    armed = False
+    reader_ident = 0
+    in_tx_flags: list[bool] = []
+
+    def execute(self, sql, params=()):
+        cursor = super().execute(sql, params)
+        if (
+            _ProgressTracingConnection.armed
+            and threading.get_ident() == _ProgressTracingConnection.reader_ident
+            and sql.lstrip().upper().startswith("SELECT")
+        ):
+            _ProgressTracingConnection.in_tx_flags.append(self.in_transaction)
+            if _ProgressTracingConnection.marker in sql:
+                assert _ProgressTracingConnection.launch is not None
+                _ProgressTracingConnection.launch.set()
+        return cursor
+
+
+def _tracing_get_connection() -> _ProgressTracingConnection:
+    conn = sqlite3.connect(
+        db._database_path(), factory=_ProgressTracingConnection
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute(f"PRAGMA busy_timeout = {db.BUSY_TIMEOUT_MS}")
+    return conn
+
+
+@contextmanager
+def _trace_progress_reader(monkeypatch, marker: str, launch: threading.Event):
+    """武装进度读跟踪：替换连接工厂，记录 SELECT 的事务状态。"""
+    monkeypatch.setattr(db, "get_connection", _tracing_get_connection)
+    _ProgressTracingConnection.marker = marker
+    _ProgressTracingConnection.launch = launch
+    _ProgressTracingConnection.in_tx_flags = []
+    _ProgressTracingConnection.reader_ident = threading.get_ident()
+    _ProgressTracingConnection.armed = True
+    try:
+        yield _ProgressTracingConnection
+    finally:
+        _ProgressTracingConnection.armed = False
+
+
+def test_progress_reads_use_single_consistent_snapshot_against_concurrent_advance(
+    client: TestClient, monkeypatch
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=5
+    )
+    eid = body["experiment_id"]
+
+    launch = threading.Event()
+    done = threading.Event()
+
+    def writer() -> None:
+        launch.wait(5)
+        db.advance_period(eid, "s1", 1, "race-advance")
+        done.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    # 在揭盲记录读取处放行写线程：读快照必须在此之前已经固定，
+    # 且所有 SELECT 都处于同一事务内（in_transaction 全为 True）。
+    with _trace_progress_reader(
+        monkeypatch, "FROM unblindings", launch
+    ) as tracer:
+        progress = client.get(
+            f"/experiments/{eid}/subjects/s1/progress"
+        ).json()
+
+    thread.join(5)
+    assert done.is_set()
+    assert tracer.in_tx_flags, "进度查询至少应有若干 SELECT 被跟踪"
+    assert all(tracer.in_tx_flags), (
+        "进度查询的每次读取都必须在显式开启的同一一致性读事务内"
+    )
+
+    # 读快照固定于并发提交之前：看到的是推进前的完整状态
+    _assert_progress_is_coherent(progress)
+    assert progress["next_period"] == 1
+    assert progress["reveals"] == []
+    assert progress["completed"] is False
+
+    # 写线程提交后重新查询：看到推进后的完整状态（next_period=2 且有第 1 期）
+    after = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    _assert_progress_is_coherent(after)
+    assert after["next_period"] == 2
+    assert [r["period"] for r in after["reveals"]] == [1]
+
+
+def test_progress_consistent_against_concurrent_completion(
+    client: TestClient, monkeypatch
+) -> None:
+    body, _ = create_experiment(
+        client,
+        conditions=["A", "B"],
+        subject_ids=["s1", "s2"],
+        seed=7,
+        washout_seconds=0,
+    )
+    eid = body["experiment_id"]
+    assert reveal_period(client, eid, "s1", 1).status_code == 200
+
+    launch = threading.Event()
+    done = threading.Event()
+
+    def writer() -> None:
+        launch.wait(5)
+        db.complete_period(eid, "s1", 1, "race-complete")
+        done.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    # 在完成记录读取处放行写线程：next_available_at 必须与进度同快照
+    with _trace_progress_reader(
+        monkeypatch, "FROM period_completions", launch
+    ):
+        progress = client.get(
+            f"/experiments/{eid}/subjects/s1/progress"
+        ).json()
+
+    thread.join(5)
+    assert done.is_set()
+    _assert_progress_is_coherent(progress)
+    assert progress["next_period"] == 2
+    assert [r["period"] for r in progress["reveals"]] == [1]
+    # 快照固定在完成登记之前：第 1 期 completed_at 与 next_available_at 同为 None
+    assert progress["reveals"][0]["completed_at"] is None
+    assert progress["next_available_at"] is None
+
+    after = client.get(f"/experiments/{eid}/subjects/s1/progress").json()
+    _assert_progress_is_coherent(after)
+    assert after["reveals"][0]["completed_at"] is not None
+
+
+def test_retired_subject_progress_not_returned_under_concurrent_replacement(
+    client: TestClient, monkeypatch
+) -> None:
+    body, _ = create_experiment(
+        client, conditions=["A", "B"], subject_ids=["s1", "s2"], seed=13
+    )
+    eid = body["experiment_id"]
+
+    launch = threading.Event()
+    done = threading.Event()
+
+    def writer() -> None:
+        launch.wait(5)
+        db.replace_subject(
+            eid, "s1", "s1-new", "race-replace", "并发换号"
+        )
+        done.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+
+    # 在名册（assignments）读取处放行写线程：墓碑与名册必须同快照。
+    # 快照固定在换号提交之前 -> 旧编号仍在册，返回 200 的换号前完整状态；
+    # 绝不会出现“墓碑已写、名册已移走”却拼出 404/409 之外结果的跨时点响应。
+    with _trace_progress_reader(
+        monkeypatch, "FROM assignments", launch
+    ):
+        resp = client.get(f"/experiments/{eid}/subjects/s1/progress")
+
+    thread.join(5)
+    assert done.is_set()
+    assert resp.status_code == 200, resp.text
+    progress = resp.json()
+    _assert_progress_is_coherent(progress)
+    assert progress["next_period"] == 1
+    assert progress["reveals"] == []
+
+    # 换号提交后：退役旧编号在新快照下一律 409，绝不再返回进度
+    tombstoned = client.get(f"/experiments/{eid}/subjects/s1/progress")
+    assert tombstoned.status_code == 409
+    assert tombstoned.json()["detail"]["reason"] == "subject_replaced"
+
+    # 新编号接管同一分配，返回完整状态
+    moved = client.get(f"/experiments/{eid}/subjects/s1-new/progress")
+    assert moved.status_code == 200
+    _assert_progress_is_coherent(moved.json())
