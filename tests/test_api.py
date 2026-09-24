@@ -1803,6 +1803,209 @@ def test_concurrent_advance_after_completion_has_single_winner(
     assert len(progress["reveals"]) == 2
 
 
+# ---------- 进度查询一致性读（跨时点拼接） ----------
+
+
+class _ProgressInterceptConn(sqlite3.Connection):
+    """仅在读进度的线程内、读完 unblindings 后暂停的连接。
+
+    用于强制“查询事务已开启且部分读取完成 → 写事务提交 → 查询继续读
+    剩余表”的交错；WAL 模式下读事务不阻塞写提交，故可真实复现跨时点。
+    类属性在每次用例开始前重置。
+    """
+
+    reader_tid: int | None = None
+    gate: threading.Event | None = None
+    done: threading.Event | None = None
+    fired = False
+
+    def execute(self, sql, parameters=()):
+        cur = super().execute(sql, parameters)
+        if (
+            not _ProgressInterceptConn.fired
+            and threading.get_ident() == _ProgressInterceptConn.reader_tid
+            and "FROM unblindings" in sql
+        ):
+            _ProgressInterceptConn.fired = True
+            assert _ProgressInterceptConn.gate is not None
+            assert _ProgressInterceptConn.done is not None
+            _ProgressInterceptConn.gate.set()
+            _ProgressInterceptConn.done.wait(timeout=10)
+        return cur
+
+
+def _enable_wal() -> None:
+    conn = db.get_connection()
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    finally:
+        conn.close()
+
+
+def _progress_while_writer_commits(
+    experiment_id: str, subject_id: str, writer
+) -> dict:
+    """在读到 unblindings 后放行 writer 提交，再继续读完进度，返回读结果。
+
+    读线程直接调用 ``db.get_progress``（返回 None / 抛异常原样记录）。
+    """
+    gate = threading.Event()
+    done = threading.Event()
+    outcome: dict = {}
+    real_get_connection = db.get_connection
+    reader_tid_box: list[int] = []
+
+    def instrumented_connection():
+        # 只对读进度线程替换连接工厂；写线程使用普通连接
+        if threading.get_ident() not in reader_tid_box:
+            return real_get_connection()
+        conn = sqlite3.connect(
+            db._database_path(),
+            timeout=10,
+            factory=_ProgressInterceptConn,
+            isolation_level=None,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {db.BUSY_TIMEOUT_MS}")
+        return conn
+
+    def reader() -> None:
+        reader_tid_box.append(threading.get_ident())
+        _ProgressInterceptConn.reader_tid = threading.get_ident()
+        _ProgressInterceptConn.gate = gate
+        _ProgressInterceptConn.done = done
+        _ProgressInterceptConn.fired = False
+        db.get_connection = instrumented_connection
+        try:
+            outcome["progress"] = db.get_progress(experiment_id, subject_id)
+        except Exception as exc:  # noqa: BLE001 - 测试需要原样断言异常类型
+            outcome["exc"] = exc
+        finally:
+            db.get_connection = real_get_connection
+
+    def committer() -> None:
+        assert gate.wait(timeout=10)
+        writer()
+        done.set()
+
+    t_reader = threading.Thread(target=reader)
+    t_writer = threading.Thread(target=committer)
+    t_reader.start()
+    t_writer.start()
+    t_reader.join(15)
+    t_writer.join(15)
+    assert not t_reader.is_alive() and not t_writer.is_alive(), "交错线程死锁"
+    return outcome
+
+
+def test_progress_snapshot_consistent_with_concurrent_advance(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "progress-advance.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 7,
+            },
+        ).json()
+        eid = created["experiment_id"]
+    _enable_wal()
+
+    # 读快照固定在推进提交之前：必须是推进前的完整状态（next_period=1 且
+    # 无任何揭盲），绝不能出现 next_period=2 却缺少第 1 期揭盲的拼接
+    outcome = _progress_while_writer_commits(
+        eid, "s1", lambda: db.advance_period(eid, "s1", 1, "r1")
+    )
+    assert "exc" not in outcome
+    pre = outcome["progress"]
+    assert pre["next_period"] == 1
+    assert pre["reveals"] == []
+    assert pre["completed"] is False
+
+    # 提交之后的新快照则是推进后的完整状态
+    post = db.get_progress(eid, "s1")
+    assert post["next_period"] == 2
+    assert [r["period"] for r in post["reveals"]] == [1]
+
+
+def test_progress_snapshot_consistent_with_concurrent_completion(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "progress-complete.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 8,
+            },
+        ).json()
+        eid = created["experiment_id"]
+        setup.post(
+            f"/experiments/{eid}/advance",
+            json={"subject_id": "s1", "expected_period": 1, "request_id": "r1"},
+        )
+    _enable_wal()
+
+    # 第 1 期已揭盲但尚未完成：写线程在读事务期间登记完成。读快照固定在
+    # 提交之前，因此该揭盲记录的 completed_at 必须仍为 None（旧状态完整），
+    # 不能读到“完成已登记”而其余字段来自更早时点的混合结果
+    outcome = _progress_while_writer_commits(
+        eid, "s1", lambda: db.complete_period(eid, "s1", 1, "c1")
+    )
+    assert "exc" not in outcome
+    pre = outcome["progress"]
+    assert pre["next_period"] == 2
+    assert [r["period"] for r in pre["reveals"]] == [1]
+    assert pre["reveals"][0]["completed_at"] is None
+    assert pre["next_available_at"] is None
+
+    post = db.get_progress(eid, "s1")
+    assert post["reveals"][0]["completed_at"] is not None
+
+
+def test_progress_retired_id_not_returned_under_concurrent_replace(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("DATABASE_PATH", str(tmp_path / "progress-replace.db"))
+    with TestClient(app) as setup:
+        created = setup.post(
+            "/experiments",
+            json={
+                "conditions": ["A", "B"],
+                "subject_ids": ["s1", "s2"],
+                "seed": 9,
+            },
+        ).json()
+        eid = created["experiment_id"]
+    _enable_wal()
+
+    # 读快照固定在换号提交之前：原编号仍在册，返回换号前的完整进度
+    outcome = _progress_while_writer_commits(
+        eid,
+        "s1",
+        lambda: db.replace_subject(eid, "s1", "s1-new", "op1", "编号录入错误"),
+    )
+    assert "exc" not in outcome
+    pre = outcome["progress"]
+    assert pre["subject_id"] == "s1"
+    assert pre["next_period"] == 1
+    assert pre["reveals"] == []
+
+    # 换号提交后的新快照：退役编号不能再返回进度（409），新编号可查
+    with TestClient(app) as verify:
+        retired = verify.get(f"/experiments/{eid}/subjects/s1/progress")
+        assert retired.status_code == 409
+        assert retired.json()["detail"]["reason"] == "subject_replaced"
+        moved = verify.get(f"/experiments/{eid}/subjects/s1-new/progress")
+        assert moved.status_code == 200
+        assert moved.json()["next_period"] == 1
+
+
 # ---------- 批量受控揭盲 ----------
 
 def advance_batch(

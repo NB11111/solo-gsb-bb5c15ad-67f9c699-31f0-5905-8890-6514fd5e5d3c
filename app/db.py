@@ -13,6 +13,9 @@
   序列只保存在服务端，不通过创建 / 详情接口下发；
   ``experiments.washout_seconds`` 为周期之间的洗脱期秒数（旧库默认 0）；
 * ``subject_progress``：每个受试者下一待揭盲周期 ``next_period``；
+  进度查询在首次读取前即以 ``BEGIN`` 开启一致性读事务，使实验配置、墓碑、
+  名册、已揭盲 / 完成记录与进度取自同一快照，避免并发推进 / 完成 / 换号
+  提交造成跨时点拼接；
 * ``unblindings``：已揭盲记录（周期 -> 条件）；
 * ``period_completions``：周期完成记录（周期 -> completed_at），
   推进下一周期前上一周期必须已完成且洗脱期已届满；
@@ -2635,45 +2638,72 @@ def list_commitments(experiment_id: str) -> list[dict[str, Any]] | None:
 def get_progress(experiment_id: str, subject_id: str) -> dict[str, Any] | None:
     """查询受试者揭盲进度。
 
+    在**首次读取之前**显式开启一个 SQLite 一致性读事务（``BEGIN``）：
+    实验配置（洗脱期）、换号墓碑、受试者名册（序列长度）、已揭盲记录、
+    周期完成记录与 ``subject_progress`` 进度全部取自**同一事务快照**。
+    因此查询期间并发的推进、完成登记或换号提交，要么在快照之前整体可见、
+    要么整体不可见，响应只可能对应并发写入前或写入后的**完整状态**：
+    不会出现“``next_period`` 已推进到 2 却缺少第 1 期揭盲记录”之类的
+    跨时点拼接；快照下已存在墓碑的退役编号一律抛出
+    :class:`SubjectReplacedError`，绝不会在新快照下返回进度。
+
     只返回已揭盲记录（含各自的完成时间）、下一周期以及下一周期最早可
     推进时间 ``next_available_at``，不包含完整序列或后续安排。
     实验或受试者不存在时返回 ``None``；已退役编号（换号墓碑）抛出
     :class:`SubjectReplacedError`（不能查询进度）。
     """
-    with closing(get_connection()) as conn:
-        experiment_row = conn.execute(
-            "SELECT washout_seconds FROM experiments WHERE id = ?",
-            (experiment_id,),
-        ).fetchone()
-        if experiment_row is None:
-            return None
-        if _is_tombstoned(conn, experiment_id, subject_id):
-            raise SubjectReplacedError()
-        assignment_row = conn.execute(
-            "SELECT sequence FROM assignments "
-            "WHERE experiment_id = ? AND subject_id = ?",
-            (experiment_id, subject_id),
-        ).fetchone()
-        if assignment_row is None:
-            return None
-        num_periods = len(json.loads(assignment_row["sequence"]))
-        washout = int(experiment_row["washout_seconds"])
+    conn = get_connection()
+    try:
+        # 显式只读事务：sqlite3 隐式事务只在 DML 前开启，裸 SELECT 各自看到
+        # 最新提交；必须在第一条 SELECT 前 BEGIN，把读快照固定在同一时点。
+        # 纯读操作用普通 deferred BEGIN（读锁），不取写锁、不阻塞其他读者。
+        conn.isolation_level = None
+        conn.execute("BEGIN")
+        try:
+            return _get_progress_locked(conn, experiment_id, subject_id)
+        finally:
+            # 只读事务统一以 ROLLBACK 结束（与其他只读重放路径的写法一致）
+            conn.rollback()
+    finally:
+        conn.close()
 
-        reveal_rows = conn.execute(
-            "SELECT period, condition, revealed_at FROM unblindings "
-            "WHERE experiment_id = ? AND subject_id = ? ORDER BY period",
-            (experiment_id, subject_id),
-        ).fetchall()
-        completion_rows = conn.execute(
-            "SELECT period, completed_at FROM period_completions "
-            "WHERE experiment_id = ? AND subject_id = ? ORDER BY period",
-            (experiment_id, subject_id),
-        ).fetchall()
-        progress_row = conn.execute(
-            "SELECT next_period FROM subject_progress "
-            "WHERE experiment_id = ? AND subject_id = ?",
-            (experiment_id, subject_id),
-        ).fetchone()
+
+def _get_progress_locked(
+    conn: sqlite3.Connection, experiment_id: str, subject_id: str
+) -> dict[str, Any] | None:
+    experiment_row = conn.execute(
+        "SELECT washout_seconds FROM experiments WHERE id = ?",
+        (experiment_id,),
+    ).fetchone()
+    if experiment_row is None:
+        return None
+    if _is_tombstoned(conn, experiment_id, subject_id):
+        raise SubjectReplacedError()
+    assignment_row = conn.execute(
+        "SELECT sequence FROM assignments "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (experiment_id, subject_id),
+    ).fetchone()
+    if assignment_row is None:
+        return None
+    num_periods = len(json.loads(assignment_row["sequence"]))
+    washout = int(experiment_row["washout_seconds"])
+
+    reveal_rows = conn.execute(
+        "SELECT period, condition, revealed_at FROM unblindings "
+        "WHERE experiment_id = ? AND subject_id = ? ORDER BY period",
+        (experiment_id, subject_id),
+    ).fetchall()
+    completion_rows = conn.execute(
+        "SELECT period, completed_at FROM period_completions "
+        "WHERE experiment_id = ? AND subject_id = ? ORDER BY period",
+        (experiment_id, subject_id),
+    ).fetchall()
+    progress_row = conn.execute(
+        "SELECT next_period FROM subject_progress "
+        "WHERE experiment_id = ? AND subject_id = ?",
+        (experiment_id, subject_id),
+    ).fetchone()
 
     next_period = progress_row["next_period"] if progress_row is not None else 1
     completed_at_by_period = {
